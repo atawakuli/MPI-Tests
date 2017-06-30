@@ -59,7 +59,7 @@ void* testFunc(void* p){
 				t2 = MPI_Wtime();
 				timeLapse = t2-t1;
 				sentBy0 = sentBy0 + (sizeof(char)*arraySize);
-				sentBy0MB = (long long)(sentBy0/1000000.0);
+				sentBy0MB = (long)(sentBy0/1000000);
 				sentCounter++;
 			}
 			else if(rank ==1){
@@ -67,12 +67,14 @@ void* testFunc(void* p){
 				dest=0;
 				source=0;
 				//receiving
-				MPI_Recv(&msgIn, arraySize, MPI_CHAR, source, tag, MPI_COMM_WORLD, &Stat);
-				//counting the number of messages received
-				counter++;
-				//Summing the amount of data sent
-				receivedBy1 = receivedBy1+ (sizeof(char)*arraySize);
-				receivedBy1MB = (long long)(receivedBy1/1000000.0);
+				int rx = MPI_Recv(&msgIn, arraySize, MPI_CHAR, source, tag, MPI_COMM_WORLD, &Stat);
+				if(rx==0){
+					//counting the number of messages received
+					counter++;
+					//Summing the amount of data sent
+					receivedBy1 = receivedBy1+ sizeof(msgIn);
+					receivedBy1MB = (long)(receivedBy1/1000000);
+				}
 			}
 		}//While
 	}
@@ -91,6 +93,7 @@ int main(int argc, char *argv[]) {
 		sleep(1);
 		if(slaveNode == 1){
 			cout << "Total data received by node 1: "<< receivedBy1MB <<" MB/s, total number of messages received: "<<counter<<" per second\n";
+			receivedBy1MB = 0;
 		}
 		else{
 			cout << "Total data sent by node 0: "<< sentBy0MB <<" MB/s, total number of messages sent: "<<sentCounter<<" per second || Time it took to send the last message: "<<timeLapse*1000000<<" Microseconds \n";
