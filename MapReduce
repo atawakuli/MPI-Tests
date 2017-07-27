@@ -1,0 +1,272 @@
+/*
+ ============================================================================
+ Name        : mpiParallelAPI.c
+ Author      : at
+ Supervisor  : Prof. Dr. Martin Theobald
+ Version     : 14.0
+ Copyright   : University of Luxembourg
+ Description : Map and Reduce Simulation using MPI (parallelism within one operation)
+ ============================================================================
+ */
+
+#include <mpi.h>
+#include <math.h>
+#include <iostream>
+#include <fstream>
+#include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+
+using namespace std;
+long sentByNPerSec, sent;
+long receivedByNPerSec, received;
+int slaveNode = 0;
+//Data load integers (size = 4 bytes)
+
+class MpiParallelOp{
+protected:
+	//number of integers
+	int numberOfElements;
+	int sizeOfElement;
+	//Number of slave nodes
+	int n;
+	int fileLength;
+	int *sizes;
+public:
+	MpiParallelOp();
+
+protected:
+
+	//Gets/generates the data
+	char * getBinaryData(){
+
+		ofstream dataSource;
+		srand(time(NULL));
+		int counter = 1;
+		dataSource.open("../dataInt.bin", ios::binary | ios::out);
+		while(counter <= numberOfElements){
+			//binary restriction
+			//using int thus restricting range to prevent overflow from squaring large integers
+			int x = rand()%10+1;
+			dataSource.write((char*) &x, sizeof(int));
+			counter++;
+		}
+		dataSource.close();
+
+		ifstream dataSource2;
+		dataSource2.open("../dataInt.bin", ios::binary | ios::in);
+		if(dataSource2){
+			int y;
+			do {
+				dataSource2.read((char*) &y, sizeof(y));
+			}while(dataSource2.peek() != EOF);
+
+			//Getting the length of the file
+			dataSource2.seekg(0, ios::end);
+			fileLength = dataSource2.tellg();
+
+			//returning back to the beginning of the file
+			dataSource2.seekg(0, ios::beg);
+
+			//Create a buffer equal to the length of the file i.e ten integers, the length is 40
+			char *buffer = new char[fileLength];
+
+			//Load the file's content to the buffer
+			//Binary data loaded
+			dataSource2.read(buffer, fileLength);
+			return buffer;
+		}
+		else{
+			char szTmp[1024];
+			getcwd(szTmp, sizeof(szTmp));
+			cout<<"problem with opening the binary file. | "<<szTmp<<"\n";
+			return NULL;
+		}
+	}//End of get data
+
+	//Converts a binary array to an array of integers
+	int * deserialize(char *binaryData, int arrLength){
+		int *intData = new int[arrLength];
+		int k=0;
+		int charLength = arrLength*sizeOfElement;
+		for(int i=0; i<charLength-3; i+=4)
+		{
+			unsigned int theInt;
+			theInt = (theInt << 8) + (unsigned char)binaryData[i+3];
+			theInt = (theInt << 8) + (unsigned char)binaryData[i+2];
+			theInt = (theInt << 8) + (unsigned char)binaryData[i+1];
+			theInt = (theInt << 8) + (unsigned char)binaryData[i];
+			intData[k] = theInt;
+			k++;
+		}
+		return intData;
+	}
+
+	//Converts an array of integers to an array of binary data
+	char * serialize(int *intData, int arrLength){
+		char *binaryData = new char[arrLength*sizeOfElement];
+		int k=0;
+		for(int i=0; i<arrLength; i++)
+		{
+			binaryData[k+3] = (unsigned char)(intData[i] >> 24) & 0xFF;
+			binaryData[k+2] = (unsigned char)(intData[i] >> 16) & 0xFF;
+			binaryData[k+1] = (unsigned char)(intData[i] >> 8) & 0xFF;
+			binaryData[k] = (unsigned char) intData[i] & 0xFF;
+			k+=4;
+		}
+		return binaryData;
+	}
+
+	int * partitionsSizes(int *intData){
+		//number of partitions equals number of nodes
+		//some partitions may be empty
+		for(int i=0; i<n; i++){
+			sizes[i]=0;
+		}
+		for(int i=0; i<numberOfElements; i++){
+			int tmp1 = intData[i]%n;
+			int tmp2 = sizes[tmp1];
+			sizes[tmp1] = tmp2+1;
+		}
+		return sizes;
+	}
+
+	//Sharding based on value
+	//Number of partitions should equal number of slaves
+	int ** partition(int *intData){
+		int **partitionsArray = new int *[n];
+		int sizesTemp[n];
+		//creates and array for each node
+		for(int i=0; i<n; i++){
+			partitionsArray[i] = new int[sizes[i]];
+			sizesTemp[i] = (int)sizes[i];
+		}
+		for(int i=0; i<numberOfElements; i++){
+			int tmp1 = intData[i]%n;
+			int loc = sizes[tmp1] - sizesTemp[tmp1];
+			partitionsArray[tmp1][loc] = (unsigned int)intData[i];
+			sizesTemp[tmp1] = sizesTemp[tmp1]-1;
+		}
+		return partitionsArray;
+	}
+
+	long sum(int *intData, int arrLength){
+		long sum=0;
+		for(int i=0; i<arrLength; i++){
+			sum = sum + (unsigned int)intData[i];
+		}
+		return sum;
+	}
+
+	int * square(int *intData, int arrLength){
+		int *squares = new int[arrLength];
+		for(int i=0; i<arrLength; i++)
+		{
+			squares[i] = (unsigned int)intData[i]*intData[i];
+		}
+		return squares;
+	}
+
+public:
+	void* mpiFunc(){
+		//MPI Initialization Code
+		int rank, world_size;
+		int tag=1;
+		MPI_Init(NULL, NULL);
+		// Get the number of processes
+		MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+		// Get the rank of the process
+		MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+		MPI_Status stat[n];
+		//MPI_Request request[4];
+		char *buffer;
+		int **partitions;
+		if(rank ==0){
+			//Getting the binary data
+			buffer = getBinaryData();
+			int *intData = deserialize(buffer, numberOfElements);
+			partitionsSizes(intData);
+			partitions = partition(intData);
+		}
+		while(true){
+			//Master Node
+			if(rank ==0){
+				long totalOfSquares = 0;
+				//Sends the partitions
+				//waits for the slave nodes to send the squares
+				//sum the squares
+				for(int i=1; i<=n; i++)
+				{
+					char *binaryPartition = serialize(partitions[i-1], sizes[i-1]);
+					MPI_Send(binaryPartition, sizes[i-1]*sizeOfElement, MPI_CHAR, i, tag, MPI_COMM_WORLD);
+					sent  = sent + sizes[i-1]*sizeOfElement;
+					char *msgIn = new char[sizes[i-1]*sizeOfElement];
+					MPI_Recv(msgIn, sizes[i-1]*sizeOfElement, MPI_CHAR, i, tag, MPI_COMM_WORLD, &stat[i-1]);
+					received = received+(long)sizes[i-1]*sizeOfElement;
+					int *pIntData = deserialize(msgIn, sizes[i-1]);
+					long partitionTotal = sum(pIntData, sizes[i-1]);
+					totalOfSquares = totalOfSquares + partitionTotal;
+				}
+			}
+			else if(rank <= n){
+				slaveNode = rank;
+				int dest=0;
+				int source=0;
+				int partitionSize;
+				MPI_Probe(source, tag, MPI_COMM_WORLD, &stat[rank-1]);
+				MPI_Get_count(&stat[rank-1], MPI_CHAR, &partitionSize);
+				char *msgIn = new char[partitionSize];
+				MPI_Recv(msgIn, partitionSize, MPI_CHAR, source, tag, MPI_COMM_WORLD, &stat[rank-1]);
+				receivedByNPerSec = receivedByNPerSec+(long)partitionSize;
+				int pNoOfElements = partitionSize/sizeOfElement;
+				int *intData = deserialize(msgIn, pNoOfElements);
+				intData = square(intData, pNoOfElements);
+				char *msgOut = serialize(intData, pNoOfElements);
+				MPI_Send(msgOut, partitionSize, MPI_CHAR, dest, tag, MPI_COMM_WORLD);
+				sentByNPerSec = sentByNPerSec+partitionSize;
+			}
+		}//End of While
+		MPI_Finalize();
+		return NULL;
+	}//End of MPI function
+
+};
+
+MpiParallelOp::MpiParallelOp(){
+	numberOfElements = 2500000;
+	sizeOfElement = sizeof(int);
+	//number of slaves nodes
+	n = 4;
+	fileLength = 0;
+	sizes = new int[n];
+}
+
+void* testFunc(void* p){
+	MpiParallelOp testObj;
+	testObj.mpiFunc();
+	return NULL;
+}
+
+int main(int argc, char *argv[]) {
+	pthread_t threadxx;
+		pthread_create(&threadxx, NULL, &testFunc, NULL);
+		while(true){
+			sleep(1);
+			if(slaveNode >= 1){
+				cout << "Slave Process ("<<slaveNode<<") | Data received: "<<(long) receivedByNPerSec<<" Byte/s, Data sent: "<<(long) sentByNPerSec<<" Byte/s\n";
+				sentByNPerSec = 0;
+				receivedByNPerSec = 0;
+			}
+			else{
+				cout << "Master process (0) | data sent: "<<(long) sent<<" Byte/s, data received: "<<received<<"Bytes/s\n";
+				sent = 0;
+				received =0;
+			}
+		}
+		pthread_exit(NULL);
+		return 0;
+}
+
+
