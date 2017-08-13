@@ -23,10 +23,13 @@ using namespace std;
 
 long MESSAGE_SIZE = 100000, sent = 0, received = 0;
 
-typedef struct threadPars {
+typedef struct pthread_p {
     int fromRank; // rank from where incoming message is expected
-    int windowSize; // maximum size of partition
-} threadPars;
+    char* inMessageBuffer;
+    int windowSize; // maximum window size in int's
+    int received; // number of bytes received
+    long partialSumOfSquares; // the result of the computation
+} pthread_p;
 
 class MPI_MapReduce {
 
@@ -134,8 +137,7 @@ class MPI_MapReduce {
       chars[k++] = (unsigned char) (value >> 24) & 0xFF;
     }
 
-    static void partition(int** partitionArrays, int* partitionSizes,
-        int* intBuffer, int intBufferSize, int n) {
+    static void partition(int** partitionArrays, int* partitionSizes, int* intBuffer, int intBufferSize, int n) {
 
       // Initialize return arrays
       for (int i = 0; i < n; i++) {
@@ -155,9 +157,7 @@ class MPI_MapReduce {
       // Check partitions
       int total = 0;
       for (int i = 0; i < n; i++) {
-        cout << "PARTITION " << i << " SIZE: " << partitionSizes[i] << "x"
-            << sizeof(int) << "=" << partitionSizes[i] * sizeof(int)
-            << " BYTES \n";
+        cout << "PARTITION " << i << " SIZE: " << partitionSizes[i] << "x" << sizeof(int) << "=" << partitionSizes[i] * sizeof(int) << " BYTES \n";
         total += partitionSizes[i] * sizeof(int);
       }
       cout << "TOTAL PARTITION SIZE: " << total << " BYTES\n";
@@ -177,11 +177,35 @@ class MPI_MapReduce {
       }
     }
 
+    static void* mpiReduceFunc(void* params) {
+
+      int tag = 1, received = 0;
+      int fromRank = ((pthread_p*) params)->fromRank;
+      int windowSize = ((pthread_p*) params)->windowSize;
+      char* inMessageBuffer = ((pthread_p*) params)->inMessageBuffer;
+
+      MPI_Status status;
+
+      MPI_Recv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, fromRank, tag, MPI_COMM_WORLD, &status);
+      cout << "+++++ THREAD RECEIVED FROM:\t" << fromRank << endl;
+      received += MESSAGE_SIZE;
+
+      int* partition = new int[windowSize];
+      int partitionSize = deserialize(inMessageBuffer, partition);
+      long partialSumOfSquares = sum(partition, partitionSize);
+
+      cout << "+++++ PARTIAL SUM OF SQUARES:\t" << partialSumOfSquares << endl;
+      ((pthread_p*) params)->partialSumOfSquares = partialSumOfSquares;
+      ((pthread_p*) params)->received = received;
+
+      return NULL;
+    } // End of Reducer thread
+
     void* mpiMapFunc() {
 
-      MPI_Init(NULL, NULL);
+      int worldSize, rank, tag = 1, level;
 
-      int worldSize, rank, tag = 1;
+      MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &level);
 
       // Get the size and ranks of all processes
       MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
@@ -198,11 +222,13 @@ class MPI_MapReduce {
         int intBufferSize = 0; // keep actual size in separate variable
 
         // Get the binary data
-        writeBinaryFile(windowSize);
+        //writeBinaryFile(windowSize);
         intBufferSize = readBinaryFile(binBuffer); // this is the window in binary format
 
         // Local buffers
-        char** outMessageBuffers = new char*[n]; // n message buffers
+        char** outMessageBuffers = new char*[n]; // n outgoing message buffers
+        char** inMessageBuffers = new char*[n]; // n incoming message buffers
+
         int** partitions = new int*[n]; // n partitions
         int* partitionSizes = new int[n]; // n sizes
 
@@ -213,135 +239,86 @@ class MPI_MapReduce {
         MPI_Request reqs[n];
         MPI_Status stats[n];
 
+        pthread_p params[n];
+        pthread_t threads[n];
+
+        long totalSumOfSquares = 0;
+
+        sleep(1); // let all workers initialize
+
+        for (int i = 0; i < n; i++) {
+          inMessageBuffers[i] = new char[MESSAGE_SIZE];
+          params[i].fromRank = i + 1;
+          params[i].windowSize = windowSize;
+          params[i].inMessageBuffer = inMessageBuffers[i];
+          pthread_create(&threads[i], NULL, &mpiReduceFunc, (void*) &params[i]);
+        }
+
+        sleep(1);
+
+        cout << "ALL REDUCER THREADS STARTED." << endl;
+
         // Send partitions to Mapper processes in non-blocking manner
         for (int i = 0; i < n; i++) {
 
           outMessageBuffers[i] = new char[MESSAGE_SIZE];
           serialize(outMessageBuffers[i], partitions[i], partitionSizes[i]);
 
-          MPI_Isend(outMessageBuffers[i], MESSAGE_SIZE, MPI_CHAR, i + 1, tag,
-          MPI_COMM_WORLD, &reqs[i]);
-          MPI_Wait(&reqs[i], &stats[i]);
-          if (reqs[i] == MPI_REQUEST_NULL) {
-            cout << "_________ SENT TO SLAVE: \t" << i + 1 << " -> "
-                << MESSAGE_SIZE << " BYTES\n";
-            sent += MESSAGE_SIZE;
-          }
-
-          // Start Reducer threads to receive incoming messages at Master
-          //threadPars params = { i + 1, windowSize };
-          //pthread_t threadxx;
-          //pthread_create(&threadxx, NULL, &MPI_MapReduce::mpiReduceFunc,
-          //    (void*) &params);
-
-          //sleep(1); // this artificial delay should be removed, currently crashes if removed, though
-
-          // Alternative, single-threaded call
-          threadPars params = { i + 1, windowSize };
-          MPI_MapReduce::mpiReduceFunc((void*) &params);
-        }
-
-        // TODO: THREAD SYNCHRONIZATION AND FINAL AGGREGATION OF PARTIAL SUMS
-
-        sleep(2); // wait before Master terminates
-
-      } else { // Slave nodes
-
-        MPI_Request request;
-        MPI_Status status;
-
-        char* inMessageBuffer = new char[MESSAGE_SIZE]; // fixed-size message buffer
-
-        MPI_Irecv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag,
-        MPI_COMM_WORLD, &request);
-        MPI_Wait(&request, &status);
-        if (request == MPI_REQUEST_NULL) {
-          cout << "_________ RECEIVED BY SLAVE: \t" << rank << " -> "
-              << MESSAGE_SIZE << " BYTES\n";
-          received += MESSAGE_SIZE;
-        }
-
-        int* partition = new int[windowSize]; // also reserve integer buffer to maximum size
-        int partitionSize = 0; // keep actual size in separate variable
-
-        partitionSize = deserialize(inMessageBuffer, partition);
-        square(partition, partitionSize);
-
-        char* outMessageBuffer = new char[MESSAGE_SIZE];
-        serialize(outMessageBuffer, partition, partitionSize);
-
-        MPI_Isend(outMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag,
-        MPI_COMM_WORLD, &request);
-        MPI_Wait(&request, &status);
-        if (request == MPI_REQUEST_NULL) {
-          cout << "_________ SENT BY SLAVE: \t" << rank << " -> "
-              << MESSAGE_SIZE << " BYTES\n";
+          MPI_Isend(outMessageBuffers[i], MESSAGE_SIZE, MPI_CHAR, i + 1, tag, MPI_COMM_WORLD, &reqs[i]);
+          cout << "_________ ASYNC-SENT TO WORKER: \t" << i + 1 << " -> " << MESSAGE_SIZE << " BYTES.\n";
           sent += MESSAGE_SIZE;
         }
 
-        // Synchronous version, Reducer will wait for this to arrive
-        //MPI_Send(outMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag,
-        //MPI_COMM_WORLD);
-        //sent += MESSAGE_SIZE;
-        //cout << "_________ SENT BY SLAVE: \t" << rank << " -> " << MESSAGE_SIZE
-        //    << " BYTES\n";
+        MPI_Waitall(n, reqs, stats);
+
+        cout << "ALL MESSAGES SENT TO WORKERS." << endl;
+
+        // Thread synchronization
+        for (int i = 0; i < n; i++) {
+          pthread_join(threads[i], NULL);
+          totalSumOfSquares += params[i].partialSumOfSquares;
+          received += params[i].received;
+        }
+
+        cout << "TOTAL SUM OF SQUARES: " << totalSumOfSquares << endl;
+
+      } else { // Slave nodes
+
+        MPI_Status status;
+
+        char* inMessageBuffer = new char[MESSAGE_SIZE]; // fixed-size incoming message buffer
+        char* outMessageBuffer = new char[MESSAGE_SIZE]; // fixed-size outgoing message buffer
+
+        MPI_Recv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag, MPI_COMM_WORLD, &status);
+        cout << "_________ RECEIVED BY WORKER: \t" << rank << " -> " << MESSAGE_SIZE << " BYTES.\n";
+        received += MESSAGE_SIZE;
+
+        int* partition = new int[windowSize]; // also reserve integer buffer to maximum size
+        int partitionSize = deserialize(inMessageBuffer, partition); // keep actual size in separate variable
+        square(partition, partitionSize);
+        serialize(outMessageBuffer, partition, partitionSize);
+
+        if (rank == 1) // simulate high workload on rank 1 only
+          sleep(1);
+
+        MPI_Send(outMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag, MPI_COMM_WORLD);
+        cout << "_________ SENT BY WORKER: \t" << rank << " -> " << MESSAGE_SIZE << " BYTES.\n";
+        sent += MESSAGE_SIZE;
       }
+
+      sleep(1);
+
+      cout << "RANK " << rank << " FINISHED: " << sent << " BYTES SENT, " << received << " BYTES RECEIVED.\n";
 
       MPI_Finalize();
-
-      cout << "RANK " << rank << " FINISHED: " << sent << " BYTES SENT, "
-          << received << " BYTES RECEIVED\n";
-
       return NULL;
-    } //End of Map function
-
-    static void* mpiReduceFunc(void* params) {
-
-      // Get the size and ranks of all processes
-      int tag = 1;
-      int fromRank = ((threadPars*) params)->fromRank;
-      int windowSize = ((threadPars*) params)->windowSize;
-
-      cout << "+++++++++++ STARTED REDUCER THREAD WAITING FOR: " << fromRank
-          << endl;
-
-      MPI_Request request;
-      MPI_Status status;
-
-      char* inMessageBuffer = new char[MESSAGE_SIZE];
-      MPI_Irecv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, fromRank, tag,
-      MPI_COMM_WORLD, &request);
-      MPI_Wait(&request, &status);
-      if (request == MPI_REQUEST_NULL) {
-        cout << "+++++++++++ RECEIVED BY REDUCER FROM: " << fromRank << endl;
-        received += MESSAGE_SIZE;
-      }
-
-      // Synchronous version, Reducer waits for this to arrive
-      //int size;
-      //MPI_Probe(fromRank, tag, MPI_COMM_WORLD, &status);
-      //MPI_Get_count(&status, MPI_CHAR, &size);
-      //MPI_Recv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, fromRank, tag,
-      //MPI_COMM_WORLD, &status);
-      //received += MESSAGE_SIZE;
-      //cout << "+++++++++++ RECEIVED BY REDUCER THREAD: " << rank
-      //    << " FROM: " << fromRank << endl;
-
-      int* partition = new int[windowSize];
-      int partitionSize = deserialize(inMessageBuffer, partition);
-      long totalOfSquares = sum(partition, partitionSize);
-
-      cout << "PARTIAL SUM OF SQUARES: " << totalOfSquares << endl;
-
-      return NULL;
-    } //End of Reduce function
+    } // End of Map function
 };
 
 MPI_MapReduce::MPI_MapReduce() {
   windowSize = 1000;
   if ((windowSize + 1) * sizeof(int) > MESSAGE_SIZE)
-    cout
-        << "WARNING: MESSAGE SIZE SET SMALLER THAN WINDOW BUFFER -- PROGRAM MAY CRASH!\n";
+    cout << "WARNING: MESSAGE SIZE SET SMALLER THAN WINDOW BUFFER -- PROGRAM MAY CRASH!\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -351,4 +328,3 @@ int main(int argc, char* argv[]) {
 
   return 0;
 }
-
