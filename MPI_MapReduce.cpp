@@ -21,12 +21,13 @@
 
 using namespace std;
 
-long MESSAGE_SIZE = 100000, sent = 0, received = 0;
+long MESSAGE_SIZE = 262148, SENT = 0, RECEIVED = 0;
+bool ACTIVE = false;
 
 typedef struct pthread_p {
+    char* inMessageBuffer; // incoming message buffer provided by master
+    int* partition; // incoming partition buffer provided by master
     int fromRank; // rank from where incoming message is expected
-    char* inMessageBuffer;
-    int windowSize; // maximum window size in int's
     int received; // number of bytes received
     long partialSumOfSquares; // the result of the computation
 } pthread_p;
@@ -35,14 +36,138 @@ class MPI_MapReduce {
 
   protected:
 
-    //Number of elements per window
-    int windowSize;
+    static const int windowSize = 1048576; // max. number of elements per window: (1048576+16)/16workers*4bytes = 262148bytes/worker
+
+    // MPI configuration
+    int worldSize; // number of nodes in the cluster
+    int rank; // rank of the current node
+
+    // Window with input data
+    int* intBuffer; // deserialized elements in window
+    int intBufferSize; // actual number of elements per window
+
+    // Local message buffers (binary)
+    char** outMessageBuffers; // static outgoing message buffers
+    char** inMessageBuffers; // static incoming message buffers
+
+    // Local partition buffers (ints)
+    int** partitions; // static partition buffers
+    int* partitionSizes; // partition sizes
+
+    // Requests & statuses
+    MPI_Request* reqs;
+    MPI_Status* stats;
+
+    // Threads & parameters
+    pthread_t* threads;
+    pthread_p* params;
 
   public:
 
-    MPI_MapReduce();
+    MPI_MapReduce(int worldSize, int rank) {
 
-  public:
+      this->worldSize = worldSize;
+      this->rank = rank;
+
+      if (rank == 0) {
+
+        int n = worldSize - 1; // number of worker nodes
+
+        // Write binary file with some sample values to simulate window
+        //writeBinaryFile(windowSize);
+
+        // Read and deserialize the binary window into integer format
+        char binBuffer[(windowSize + 1) * sizeof(int)];
+        intBuffer = new int[windowSize];
+        intBufferSize = readBinaryFile(binBuffer);
+        deserialize(binBuffer, intBuffer);
+
+        // Local message buffers (binary)
+        outMessageBuffers = new char*[n];
+        inMessageBuffers = new char*[n];
+
+        // Local partition buffers (ints)
+        partitions = new int*[n];
+        partitionSizes = new int[n];
+
+        // Requests & statuses
+        reqs = new MPI_Request[n];
+        stats = new MPI_Status[n];
+
+        // Threads & parameters
+        threads = new pthread_t[n];
+        params = new pthread_p[n];
+
+        // Individual buffers
+        for (int i = 0; i < n; i++) {
+          outMessageBuffers[i] = new char[MESSAGE_SIZE];
+          inMessageBuffers[i] = new char[MESSAGE_SIZE];
+          partitions[i] = new int[windowSize / n]; // cautions: assumes uniform partition sizes!
+        }
+
+        //cout << "MASTER INIT DONE." << endl;
+
+      } else {
+
+        // Local message buffers (binary)
+        outMessageBuffers = new char*[1];
+        inMessageBuffers = new char*[1];
+        outMessageBuffers[0] = new char[MESSAGE_SIZE];
+        inMessageBuffers[0] = new char[MESSAGE_SIZE];
+
+        // Local partition buffers (ints)
+        partitions = new int*[1];
+        partitions[0] = new int[windowSize];
+        partitionSizes = new int[1];
+
+        // Requests & statuses
+        reqs = new MPI_Request[1];
+        stats = new MPI_Status[1];
+
+        //cout << "SLAVE " << rank << " INIT DONE." << endl;
+      }
+    }
+
+    ~MPI_MapReduce() {
+
+      if (rank == 0) {
+
+        delete[] intBuffer;
+
+        // All local buffers
+        for (int i = 0; i < worldSize - 1; i++) {
+          delete[] outMessageBuffers[i];
+          delete[] inMessageBuffers[i];
+          delete[] partitions[i];
+        }
+        delete[] outMessageBuffers;
+        delete[] inMessageBuffers;
+        delete[] partitions;
+        delete[] partitionSizes;
+
+        // Requests & statuses
+        delete[] reqs;
+        delete[] stats;
+
+        // Threads & parameters
+        delete[] threads;
+        delete[] params;
+
+      } else {
+
+        // All local buffers
+        delete[] outMessageBuffers[0];
+        delete[] inMessageBuffers[0];
+        delete[] partitions[0];
+        delete[] outMessageBuffers;
+        delete[] inMessageBuffers;
+        delete[] partitions;
+        delete[] partitionSizes;
+        delete[] stats;
+        delete[] reqs;
+
+      }
+    }
 
     // Write the file with 'numberOfElements' int values
     static void writeBinaryFile(int numberOfElements) {
@@ -51,7 +176,7 @@ class MPI_MapReduce {
       srand(time(NULL));
 
       ofstream dataSource;
-      dataSource.open("../dataInt.bin", ios::binary | ios::out);
+      dataSource.open("./data.bin", ios::binary | ios::out);
       dataSource.write((char*) &numberOfElements, sizeOfElement); //first value in file indicates length
 
       for (int i = 0; i < numberOfElements; i++) {
@@ -61,7 +186,7 @@ class MPI_MapReduce {
       }
 
       dataSource.close();
-      //cout << numberOfElements * sizeOfElement << "\tBYTES WRITTEN.\n";
+      //cout << (numberOfElements + 1) * sizeOfElement << "\tBYTES WRITTEN.\n";
     }
 
     // Read the file (size must be multiple of 'sizeOfElement')
@@ -71,13 +196,14 @@ class MPI_MapReduce {
       int bufferSize = 0; // size of buffer to be returned
 
       ifstream dataSource;
-      dataSource.open("../dataInt.bin", ios::binary | ios::in);
+      dataSource.open("./data.bin", ios::binary | ios::in);
 
       if (dataSource) {
 
         dataSource.read(&buffer[0], sizeOfElement); // first value contains length
         bufferSize = decode(&buffer[0]); // so get length of file first
         dataSource.read(&buffer[sizeOfElement], bufferSize * sizeOfElement); // then read rest of file in one chunck
+        //cout << (bufferSize + 1) * sizeOfElement << "\tBYTES READ.\n";
 
       } else {
 
@@ -92,7 +218,7 @@ class MPI_MapReduce {
       return bufferSize;
     }
 
-    //Converts a binary array of chars to an array of integers
+    // Converts a binary array of chars to an array of integers
     static int deserialize(char* binData, int* intData) {
       int sizeOfElement = sizeof(int);
       int intDataLength = decode(&binData[0]);
@@ -108,8 +234,8 @@ class MPI_MapReduce {
       return intDataLength;
     }
 
-    //Converts an array of integers to an array of chars
-    void serialize(char* binData, int* intData, int intDataLength) {
+    // Converts an array of integers to an array of chars
+    static void serialize(char* binData, int* intData, int intDataLength) {
       encode(&binData[0], intDataLength);
       //cout << "SERIALIZE LENGTH: " << intDataLength << endl;
       int k = 4;
@@ -141,16 +267,14 @@ class MPI_MapReduce {
 
       // Initialize return arrays
       for (int i = 0; i < n; i++) {
-        partitionArrays[i] = new int[intBufferSize / n];
         partitionSizes[i] = 0;
       }
 
       // Fill the partitions
       for (int i = 0; i < intBufferSize; i++) {
         int val = intBuffer[i];
-        int pos = partitionSizes[val % n];
-        //cout << "IDX: " << val % n << endl;
-        partitionArrays[val % n][pos] = val;
+        int idx = partitionSizes[val % n];
+        partitionArrays[val % n][idx] = val;
         partitionSizes[val % n]++;
       }
 
@@ -159,6 +283,8 @@ class MPI_MapReduce {
       for (int i = 0; i < n; i++) {
         cout << "PARTITION " << i << " SIZE: " << partitionSizes[i] << "x" << sizeof(int) << "=" << partitionSizes[i] * sizeof(int) << " BYTES \n";
         total += partitionSizes[i] * sizeof(int);
+        if ((partitionSizes[i] + 1) * sizeof(int) > MESSAGE_SIZE)
+          cout << "WARNING: PARTITION SIZE SET LARGER THAN MESSAGE BUFFER -- PROGRAM MAY CRASH!\n";
       }
       cout << "TOTAL PARTITION SIZE: " << total << " BYTES\n";
     }
@@ -179,152 +305,122 @@ class MPI_MapReduce {
 
     static void* mpiReduceFunc(void* params) {
 
-      int tag = 1, received = 0;
-      int fromRank = ((pthread_p*) params)->fromRank;
-      int windowSize = ((pthread_p*) params)->windowSize;
+      int tag = 1;
+
+      // Local message buffer & rank from where to receive message
       char* inMessageBuffer = ((pthread_p*) params)->inMessageBuffer;
+      int* partition = ((pthread_p*) params)->partition;
+      int fromRank = ((pthread_p*) params)->fromRank;
 
       MPI_Status status;
-
       MPI_Recv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, fromRank, tag, MPI_COMM_WORLD, &status);
-      cout << "+++++ THREAD RECEIVED FROM:\t" << fromRank << endl;
-      received += MESSAGE_SIZE;
+      //cout << "+++++++++ REDUCER RECEIVED FROM: " << fromRank << endl;
 
-      int* partition = new int[windowSize];
+      // Manage local partition buffer
       int partitionSize = deserialize(inMessageBuffer, partition);
       long partialSumOfSquares = sum(partition, partitionSize);
+      //cout << "+++++++++ PARTIAL SUM OF SQUARES: " << partialSumOfSquares << endl;
 
-      cout << "+++++ PARTIAL SUM OF SQUARES:\t" << partialSumOfSquares << endl;
       ((pthread_p*) params)->partialSumOfSquares = partialSumOfSquares;
-      ((pthread_p*) params)->received = received;
+      ((pthread_p*) params)->received = MESSAGE_SIZE;
 
       return NULL;
     } // End of Reducer thread
 
     void* mpiMapFunc() {
 
-      int worldSize, rank, tag = 1, level;
-
-      MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &level);
-
-      // Get the size and ranks of all processes
-      MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
-      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
-      int n = worldSize - 1; // rank 0 always reserved as master, rest as slaves
+      int tag = 1, n = worldSize - 1; // rank 0 always reserved as master, rest as slaves
 
       if (rank == 0) { // Master node
 
-        cout << "WORLD: " << worldSize << ", " << n << " WORKER(S).\n";
+        cout << "MAPREDUCE USING 1 MASTER & " << n << " WORKER(S).\n";
 
-        char* binBuffer = new char[(windowSize + 1) * sizeof(int)]; // always reserve binary buffer to maximum size (plus one for length indicator)
-        int* intBuffer = new int[windowSize]; // also reserve integer buffer to maximum size
-        int intBufferSize = 0; // keep actual size in separate variable
-
-        // Get the binary data
-        //writeBinaryFile(windowSize);
-        intBufferSize = readBinaryFile(binBuffer); // this is the window in binary format
-
-        // Local buffers
-        char** outMessageBuffers = new char*[n]; // n outgoing message buffers
-        char** inMessageBuffers = new char*[n]; // n incoming message buffers
-
-        int** partitions = new int*[n]; // n partitions
-        int* partitionSizes = new int[n]; // n sizes
-
-        // Deserialize and partition the binary data
-        deserialize(binBuffer, intBuffer); // this is the window in integer format
         partition(partitions, partitionSizes, intBuffer, intBufferSize, n); // these are the partitions of the window in integer format
 
-        MPI_Request reqs[n];
-        MPI_Status stats[n];
-
-        pthread_p params[n];
-        pthread_t threads[n];
-
-        long totalSumOfSquares = 0;
-
-        sleep(1); // let all workers initialize
-
+        // Start Reducer threads and send partitions to Mapper processes in non-blocking manner
         for (int i = 0; i < n; i++) {
-          inMessageBuffers[i] = new char[MESSAGE_SIZE];
           params[i].fromRank = i + 1;
-          params[i].windowSize = windowSize;
           params[i].inMessageBuffer = inMessageBuffers[i];
+          params[i].partition = partitions[i];
           pthread_create(&threads[i], NULL, &mpiReduceFunc, (void*) &params[i]);
-        }
 
-        sleep(1);
-
-        cout << "ALL REDUCER THREADS STARTED." << endl;
-
-        // Send partitions to Mapper processes in non-blocking manner
-        for (int i = 0; i < n; i++) {
-
-          outMessageBuffers[i] = new char[MESSAGE_SIZE];
           serialize(outMessageBuffers[i], partitions[i], partitionSizes[i]);
 
           MPI_Isend(outMessageBuffers[i], MESSAGE_SIZE, MPI_CHAR, i + 1, tag, MPI_COMM_WORLD, &reqs[i]);
-          cout << "_________ ASYNC-SENT TO WORKER: \t" << i + 1 << " -> " << MESSAGE_SIZE << " BYTES.\n";
-          sent += MESSAGE_SIZE;
+          SENT += MESSAGE_SIZE;
+          //cout << "_________ SENT TO WORKER: " << i + 1 << " -> " << MESSAGE_SIZE << " BYTES.\n";
         }
 
-        MPI_Waitall(n, reqs, stats);
-
-        cout << "ALL MESSAGES SENT TO WORKERS." << endl;
+        //MPI_Waitall(n, reqs, stats); // MPI synchronization
+        //cout << "ALL MESSAGES SENT TO WORKERS." << endl;
 
         // Thread synchronization
+        long totalSumOfSquares = 0;
         for (int i = 0; i < n; i++) {
-          pthread_join(threads[i], NULL);
+          pthread_join(threads[i], NULL); // thread synchronization
           totalSumOfSquares += params[i].partialSumOfSquares;
-          received += params[i].received;
+          RECEIVED += params[i].received;
         }
 
         cout << "TOTAL SUM OF SQUARES: " << totalSumOfSquares << endl;
 
       } else { // Slave nodes
 
-        MPI_Status status;
+        MPI_Recv(inMessageBuffers[0], MESSAGE_SIZE, MPI_CHAR, 0, tag, MPI_COMM_WORLD, &stats[0]);
+        RECEIVED += MESSAGE_SIZE;
+        //cout << "_________ RECEIVED BY WORKER: " << rank << " -> " << MESSAGE_SIZE << " BYTES.\n";
 
-        char* inMessageBuffer = new char[MESSAGE_SIZE]; // fixed-size incoming message buffer
-        char* outMessageBuffer = new char[MESSAGE_SIZE]; // fixed-size outgoing message buffer
+        partitionSizes[0] = deserialize(inMessageBuffers[0], partitions[0]); // keep actual size in separate variable
+        square(partitions[0], partitionSizes[0]);
+        serialize(outMessageBuffers[0], partitions[0], partitionSizes[0]);
 
-        MPI_Recv(inMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag, MPI_COMM_WORLD, &status);
-        cout << "_________ RECEIVED BY WORKER: \t" << rank << " -> " << MESSAGE_SIZE << " BYTES.\n";
-        received += MESSAGE_SIZE;
-
-        int* partition = new int[windowSize]; // also reserve integer buffer to maximum size
-        int partitionSize = deserialize(inMessageBuffer, partition); // keep actual size in separate variable
-        square(partition, partitionSize);
-        serialize(outMessageBuffer, partition, partitionSize);
-
-        if (rank == 1) // simulate high workload on rank 1 only
-          sleep(1);
-
-        MPI_Send(outMessageBuffer, MESSAGE_SIZE, MPI_CHAR, 0, tag, MPI_COMM_WORLD);
-        cout << "_________ SENT BY WORKER: \t" << rank << " -> " << MESSAGE_SIZE << " BYTES.\n";
-        sent += MESSAGE_SIZE;
+        MPI_Send(outMessageBuffers[0], MESSAGE_SIZE, MPI_CHAR, 0, tag, MPI_COMM_WORLD);
+        SENT += MESSAGE_SIZE;
+        //cout << "_________ SENT BY WORKER: " << rank << " -> " << MESSAGE_SIZE << " BYTES.\n";
       }
 
-      sleep(1);
+      //cout << "RANK " << rank << " FINISHED." << endl;
 
-      cout << "RANK " << rank << " FINISHED: " << sent << " BYTES SENT, " << received << " BYTES RECEIVED.\n";
-
-      MPI_Finalize();
       return NULL;
     } // End of Map function
 };
 
-MPI_MapReduce::MPI_MapReduce() {
-  windowSize = 1000;
-  if ((windowSize + 1) * sizeof(int) > MESSAGE_SIZE)
-    cout << "WARNING: MESSAGE SIZE SET SMALLER THAN WINDOW BUFFER -- PROGRAM MAY CRASH!\n";
+void* timerFunc(void* params) {
+  int i = 1;
+  while (ACTIVE) {
+    sleep(1);
+    cout << "MASTER: " << (SENT / i) << " BYTES/SEC SENT, " << (RECEIVED / i) << " BYTES/SEC RECEIVED." << endl;
+    i++;
+  }
+  return NULL;
 }
 
 int main(int argc, char* argv[]) {
 
-  MPI_MapReduce testObj;
-  testObj.mpiMapFunc();
+  int level, worldSize, rank;
+
+  // Initialize the MPI environment
+  MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &level);
+
+  // Get the size and ranks of all processes
+  MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  ACTIVE = true;
+
+  if (rank == 0) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, &timerFunc, NULL);
+  }
+
+  MPI_MapReduce testObj(worldSize, rank);
+  for (int i = 0; i < 1000; i++)
+    testObj.mpiMapFunc();
+
+  ACTIVE = false;
+
+  // Close the MPI environment
+  MPI_Finalize();
 
   return 0;
 }
